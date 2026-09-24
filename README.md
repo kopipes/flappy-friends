@@ -2,7 +2,7 @@
 
 Game browser 3D dengan mode sendiri dan sesi bersama hingga 8 pemain. Pemain yang membuat sesi menjadi host dan dapat memulai kapan saja, termasuk saat masih sendirian. Peserta masuk dengan nama dan kode sesi 5 karakter atau tautan undangan. Tersedia level **Normal** dan **Hard**; Hard mempercepat pipa, merapatkan jaraknya, dan mempersempit celah. Pada mode bersama, host memilih level di lobby dan semua peserta memakai level yang sama. Sebelum hitung mundur, setiap perangkat menyiapkan tampilan dan memberi sinyal siap agar pemain tidak langsung gugur saat game mulai. Setelah semua pemain gugur, host dapat memulai ronde baru tanpa membuat sesi atau membagikan kode lagi. Rekor lokal disimpan terpisah per level.
 
-Jika ada minimal dua pemain, item power-up ×3 dan ×5 muncul bergantian di antara deret pipa. Item langsung aktif saat diambil. Selama 4 detik, pemain lain harus mengetuk cepat 3 atau 5 kali dalam 1,1 detik untuk satu kepakan. Pemilik item tidak terkena efek itemnya sendiri.
+Jika ada minimal dua pemain, item power-up 3 detik dan 5 detik muncul bergantian di antara deret pipa. Burung yang mengambil item langsung dapat menembus pipa selama durasi tersebut. Ketukan tetap normal; burung masih harus mengepak dan tetap bisa gugur jika menyentuh tanah atau batas atas.
 
 ## Jalankan
 

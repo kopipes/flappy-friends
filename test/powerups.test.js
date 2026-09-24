@@ -6,117 +6,91 @@ function roomWithPlayers(count = 2) {
   const players = Array.from({ length: count }, (_, i) => {
     const peer = { id: `p${i}`, closed: false, writes: [], socket: { writableLength: 0, write(data) { peer.writes.push(data); } } };
     return { peer, id: peer.id, name: `P${i}`, color: i, y: 0, vy: 0, alive: true, score: 0,
-      lastFlap: 0, lastPress: 0, comboStartedAt: 0, requiredFlaps: 1, flapProgress: 0 };
+      lastFlap: 0, phaseUntil: 0 };
   });
   const room = { code: 'TEST1', hostId: players[0].id, phase: 'playing', difficulty: 'normal', players,
-    obstacles: [], powerUps: [], effects: [], ready: new Set(), roundId: 1, startsAt: null,
-    elapsed: 0, nextId: 1, nextPowerId: 1, spawnIn: 0, broadcastIn: 0, timer: null };
+    obstacles: [], powerUps: [], ready: new Set(), roundId: 1, startsAt: null,
+    elapsed: 0, nextId: 1, nextPowerId: 1, spawnIn: 100, broadcastIn: 0, timer: null };
   for (const player of players) player.peer.room = room;
   return room;
 }
 
-function press(player) {
-  player.lastPress = 0;
-  handleMessage(player.peer, JSON.stringify({ type: 'flap' }));
+function collect(room, durationSeconds, owner = room.players[0]) {
+  room.powerUps.push({ id: durationSeconds, x: -1.45, y: owner.y, durationSeconds });
+  for (const other of room.players) if (other !== owner) other.y = owner.y + 1.5;
+  tick(room, 1 / 60);
 }
 
-test('power-up appears between pipes and only one bird collects it', () => {
+test('items appear between pipes, alternating three and five seconds', () => {
   const room = roomWithPlayers();
+  room.spawnIn = 0;
   tick(room, 1 / 60);
-  assert.equal(room.powerUps.length, 1);
-  const item = room.powerUps[0];
-  assert.equal(item.strength, 3);
-  assert.ok(item.x > room.obstacles[0].x);
-  room.players[0].y = item.y;
-  room.players[1].y = item.y;
-  item.x = -1.45;
-  tick(room, 1 / 60);
-  assert.equal(room.effects.length, 1);
-  assert.equal(room.effects[0].ownerId, room.players[0].id);
-  assert.equal(room.players[0].requiredFlaps, 1);
-  assert.equal(room.players[1].requiredFlaps, 3);
-  assert.ok(room.players[0].peer.writes.some(frame => frame.includes('"type":"powerup"')));
-  assert.equal(room.powerUps.length, 0);
-});
-
-test('second item is ×5 and solo rooms do not spawn attack items', () => {
-  const room = roomWithPlayers();
+  assert.equal(room.powerUps[0].durationSeconds, 3);
+  assert.ok(room.powerUps[0].x > room.obstacles[0].x);
   room.nextId = 4;
   room.nextPowerId = 2;
+  room.spawnIn = 0;
   tick(room, 1 / 60);
-  assert.equal(room.powerUps[0].strength, 5);
+  assert.equal(room.powerUps[1].durationSeconds, 5);
   const solo = roomWithPlayers(1);
+  solo.spawnIn = 0;
   tick(solo, 1 / 60);
   assert.equal(solo.powerUps.length, 0);
 });
 
-test('pickup immediately requires three or five quick presses from other players', () => {
+test('collecting an item immediately protects only its bird for the stated duration', () => {
   const room = roomWithPlayers();
-  const [owner, target] = room.players;
-  room.spawnIn = 100;
-  target.y = 1.5;
-  room.powerUps.push({ id: 1, x: -1.45, y: owner.y, strength: 3 });
-  tick(room, 1 / 60);
-  assert.equal(owner.requiredFlaps, 1);
-  assert.equal(target.requiredFlaps, 3);
-  target.vy = -1;
-  press(target); press(target);
-  assert.equal(target.vy, -1);
-  assert.equal(target.flapProgress, 2);
-  press(target);
-  assert.equal(target.vy, 4.65);
-  assert.equal(target.flapProgress, 0);
-
-  room.powerUps.push({ id: 2, x: -1.45, y: owner.y, strength: 5 });
-  tick(room, 1 / 60);
-  assert.equal(target.requiredFlaps, 5);
-  target.vy = -1;
-  target.lastFlap = 0;
-  for (let i = 0; i < 3; i++) press(target);
-  target.comboStartedAt = Date.now() - 1200;
-  tick(room, 1 / 60);
-  assert.equal(target.flapProgress, 0);
-  target.vy = -1;
-  for (let i = 0; i < 4; i++) press(target);
-  assert.equal(target.vy, -1);
-  assert.equal(target.flapProgress, 4);
-  press(target);
-  assert.equal(target.vy, 4.65);
-  assert.equal(target.flapProgress, 0);
-
-  for (const effect of room.effects) effect.until = Date.now() - 1;
-  tick(room, 1 / 60);
-  assert.equal(target.requiredFlaps, 1);
-  assert.equal(stateSnapshot(room).players[1].effectMs, 0);
+  const before = Date.now();
+  collect(room, 3);
+  assert.equal(room.powerUps.length, 0);
+  assert.ok(room.players[0].phaseUntil >= before + 3000);
+  assert.equal(room.players[1].phaseUntil, 0);
+  assert.ok(room.players[0].peer.writes.some(frame => frame.includes('"type":"powerup"')));
+  assert.ok(stateSnapshot(room).players[0].phaseMs > 2900);
+  collect(room, 5);
+  assert.ok(stateSnapshot(room).players[0].phaseMs > 4900);
 });
 
-test('fallen birds cannot collect an item and forged activation is ignored', () => {
+test('protected bird passes through a pipe while an unprotected bird collides', () => {
   const room = roomWithPlayers();
-  const [owner, target] = room.players;
-  room.spawnIn = 100;
-  owner.alive = false;
-  target.y = 2;
-  room.powerUps.push({ id: 1, x: -1.45, y: 0, strength: 5 });
+  room.players[0].phaseUntil = Date.now() + 3000;
+  room.obstacles.push({ id: 1, x: -1.45, gapY: 2, gap: 2.85, passed: new Set() });
   tick(room, 1 / 60);
-  assert.equal(room.powerUps.length, 1);
-  assert.equal(room.effects.length, 0);
-  handleMessage(owner.peer, JSON.stringify({ type: 'activate' }));
-  assert.equal(room.effects.length, 0);
+  assert.equal(room.players[0].alive, true);
+  assert.equal(room.players[1].alive, false);
 });
 
-test('rematch clears remaining items and active effects', () => {
+test('protection expires and does not prevent hitting the ground', () => {
+  const expired = roomWithPlayers();
+  expired.players[0].phaseUntil = Date.now() - 1;
+  expired.obstacles.push({ id: 1, x: -1.45, gapY: 2, gap: 2.85, passed: new Set() });
+  tick(expired, 1 / 60);
+  assert.equal(expired.players[0].alive, false);
+
+  const grounded = roomWithPlayers();
+  grounded.players[0].phaseUntil = Date.now() + 5000;
+  grounded.players[0].y = -3.2;
+  tick(grounded, 1 / 60);
+  assert.equal(grounded.players[0].alive, false);
+});
+
+test('one flap remains one press for every player', () => {
+  const room = roomWithPlayers();
+  room.players[0].phaseUntil = Date.now() + 5000;
+  for (const player of room.players) {
+    player.vy = -1;
+    handleMessage(player.peer, JSON.stringify({ type: 'flap' }));
+    assert.equal(player.vy, 4.65);
+  }
+});
+
+test('rematch clears protection and remaining items', () => {
   const room = roomWithPlayers();
   room.phase = 'countdown';
-  room.powerUps.push({ id: 1, x: 2, y: 0, strength: 3 });
-  room.effects.push({ ownerId: room.players[0].id, strength: 5, until: Date.now() + 4000 });
-  room.players[1].requiredFlaps = 5;
-  room.players[1].flapProgress = 4;
-  room.players[1].comboStartedAt = Date.now();
+  room.powerUps.push({ id: 1, x: 2, y: 0, durationSeconds: 3 });
+  room.players[0].phaseUntil = Date.now() + 5000;
   begin(room);
   clearInterval(room.timer);
   assert.equal(room.powerUps.length, 0);
-  assert.equal(room.effects.length, 0);
-  assert.equal(room.players[1].requiredFlaps, 1);
-  assert.equal(room.players[1].flapProgress, 0);
-  assert.equal(room.players[1].comboStartedAt, 0);
+  assert.equal(room.players[0].phaseUntil, 0);
 });

@@ -18,8 +18,6 @@ const GRAVITY = -13.2;
 const FLAP = 4.65;
 const PIPE_WIDTH = 0.86;
 const MAX_PLAYERS = 8;
-const POWERUP_DURATION_MS = 4000;
-const POWERUP_COMBO_MS = 1100;
 const PREPARE_TIMEOUT_MS = 20000;
 const DIFFICULTIES = Object.freeze({
   normal: { startSpeed: 2.65, maxSpeed: 3.7, speedRamp: 0.012, startGap: 2.85, minGap: 2.22, gapRamp: 0.004, spacing: 3.85 },
@@ -72,17 +70,10 @@ function stateSnapshot(room) {
   return {
     type: 'state', phase: room.phase, speed: obstacleSpeed(room),
     players: room.players.map(p => ({ id: p.id, y: p.y, vy: p.vy, alive: p.alive, score: p.score,
-      requiredFlaps: p.requiredFlaps, flapProgress: p.flapProgress,
-      effectMs: Math.max(0, ...room.effects.filter(e => e.ownerId !== p.id && e.strength === p.requiredFlaps).map(e => e.until - now)) })),
+      phaseMs: Math.max(0, p.phaseUntil - now) })),
     obstacles: room.obstacles.map(o => ({ id: o.id, x: o.x, gapY: o.gapY, gap: o.gap })),
-    powerUps: room.powerUps.map(o => ({ id: o.id, x: o.x, y: o.y, strength: o.strength })),
+    powerUps: room.powerUps.map(o => ({ id: o.id, x: o.x, y: o.y, durationSeconds: o.durationSeconds })),
   };
-}
-
-function syncFlapRequirement(room, player, now = Date.now()) {
-  const required = Math.max(1, ...room.effects.filter(e => e.ownerId !== player.id && e.until > now).map(e => e.strength));
-  if (player.requiredFlaps !== required) { player.requiredFlaps = required; player.flapProgress = 0; player.comboStartedAt = 0; }
-  return required;
 }
 
 function makeCode() {
@@ -122,7 +113,7 @@ function createRoom(peer, name) {
   if (rooms.size >= 500) return send(peer, { type: 'error', message: 'Server sedang penuh. Coba sebentar lagi.' });
   leave(peer);
   const code = makeCode();
-  const room = { code, hostId: peer.id, phase: 'lobby', difficulty: 'normal', players: [], obstacles: [], powerUps: [], effects: [], timer: null,
+  const room = { code, hostId: peer.id, phase: 'lobby', difficulty: 'normal', players: [], obstacles: [], powerUps: [], timer: null,
     countdownTimer: null, prepareTimer: null, startsAt: null, previousPhase: null, roundId: 0, ready: new Set(),
     elapsed: 0, nextId: 1, nextPowerId: 1, spawnIn: 1.55, broadcastIn: 0 };
   rooms.set(code, room);
@@ -134,7 +125,7 @@ function addPlayer(room, peer, name) {
   const usedColors = new Set(room.players.map(p => p.color));
   const color = Array.from({ length: MAX_PLAYERS }, (_, i) => i).find(i => !usedColors.has(i));
   room.players.push({ peer, id: peer.id, name: cleanName(name), color, y: 0, vy: 0, alive: true, score: 0,
-    lastFlap: 0, lastPress: 0, comboStartedAt: 0, requiredFlaps: 1, flapProgress: 0 });
+    lastFlap: 0, phaseUntil: 0 });
   send(peer, { type: 'joined', id: peer.id });
   broadcast(room, roomSnapshot(room));
 }
@@ -189,13 +180,12 @@ function begin(room) {
   room.elapsed = 0;
   room.obstacles = [];
   room.powerUps = [];
-  room.effects = [];
   room.nextId = 1;
   room.nextPowerId = 1;
   room.spawnIn = 1.35;
   room.broadcastIn = 0;
   for (const p of room.players) Object.assign(p, { y: 0, vy: FLAP, alive: true, score: 0,
-    lastFlap: 0, lastPress: 0, comboStartedAt: 0, requiredFlaps: 1, flapProgress: 0 });
+    lastFlap: 0, phaseUntil: 0 });
   broadcast(room, roomSnapshot(room));
   broadcast(room, stateSnapshot(room));
   room.timer = setInterval(() => tick(room, 1 / 60), 1000 / 60);
@@ -214,11 +204,6 @@ function tick(room, dt) {
   if (room.phase !== 'playing') return;
   room.elapsed += dt;
   const now = Date.now();
-  room.effects = room.effects.filter(e => e.until > now);
-  for (const p of room.players) {
-    syncFlapRequirement(room, p, now);
-    if (p.comboStartedAt && now - p.comboStartedAt > POWERUP_COMBO_MS) { p.comboStartedAt = 0; p.flapProgress = 0; }
-  }
   const settings = DIFFICULTIES[room.difficulty];
   const speed = obstacleSpeed(room);
   room.spawnIn -= dt;
@@ -229,7 +214,7 @@ function tick(room, dt) {
     if (room.players.length > 1 && obstacle.id % 3 === 1) {
       room.powerUps.push({ id: room.nextPowerId, x: 4.7 + settings.spacing / 2,
         y: Math.max(FLOOR + 1, Math.min(CEILING - 1, obstacle.gapY)),
-        strength: room.nextPowerId % 2 ? 3 : 5 });
+        durationSeconds: room.nextPowerId % 2 ? 3 : 5 });
       room.nextPowerId++;
     }
     room.spawnIn += settings.spacing / speed;
@@ -244,7 +229,7 @@ function tick(room, dt) {
     p.y += p.vy * dt;
     if (p.y - RADIUS <= FLOOR || p.y + RADIUS >= CEILING) p.alive = false;
     for (const o of room.obstacles) {
-      if (Math.abs(o.x - BIRD_X) < PIPE_WIDTH / 2 + RADIUS - 0.04 &&
+      if (p.phaseUntil <= now && Math.abs(o.x - BIRD_X) < PIPE_WIDTH / 2 + RADIUS - 0.04 &&
           (p.y + RADIUS > o.gapY + o.gap / 2 || p.y - RADIUS < o.gapY - o.gap / 2)) p.alive = false;
       if (!o.passed.has(p.id) && o.x + PIPE_WIDTH / 2 < BIRD_X - RADIUS) {
         o.passed.add(p.id);
@@ -259,9 +244,8 @@ function tick(room, dt) {
     if (!candidates.length) continue;
     const owner = candidates[0];
     room.powerUps.splice(room.powerUps.indexOf(item), 1);
-    room.effects.push({ ownerId: owner.id, strength: item.strength, until: now + POWERUP_DURATION_MS });
-    for (const player of room.players) syncFlapRequirement(room, player, now);
-    broadcast(room, { type: 'powerup', ownerId: owner.id, strength: item.strength });
+    owner.phaseUntil = Math.max(owner.phaseUntil, now + item.durationSeconds * 1000);
+    broadcast(room, { type: 'powerup', ownerId: owner.id, durationSeconds: item.durationSeconds });
     broadcast(room, stateSnapshot(room));
   }
   room.broadcastIn -= dt;
@@ -293,15 +277,7 @@ function handleMessage(peer, raw) {
   else if (msg.type === 'flap' && peer.room?.phase === 'playing') {
     const room = peer.room, p = room.players.find(x => x.peer === peer);
     const now = Date.now();
-    if (!p?.alive || now - p.lastPress < 45 || now - p.lastFlap < 85) return;
-    p.lastPress = now;
-    const required = syncFlapRequirement(room, p, now);
-    if (required > 1 && (!p.comboStartedAt || now - p.comboStartedAt > POWERUP_COMBO_MS)) {
-      p.comboStartedAt = now;
-      p.flapProgress = 0;
-    }
-    p.flapProgress++;
-    if (p.flapProgress >= required) { p.vy = FLAP; p.lastFlap = now; p.flapProgress = 0; p.comboStartedAt = 0; }
+    if (p?.alive && now - p.lastFlap > 85) { p.vy = FLAP; p.lastFlap = now; }
   }
 }
 
