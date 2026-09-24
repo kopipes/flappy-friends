@@ -17,7 +17,9 @@ const RADIUS = 0.27;
 const GRAVITY = -13.2;
 const FLAP = 4.65;
 const PIPE_WIDTH = 0.86;
-const MAX_PLAYERS = 7;
+const MAX_PLAYERS = 8;
+const POWERUP_DURATION_MS = 4000;
+const PREPARE_TIMEOUT_MS = 20000;
 const DIFFICULTIES = Object.freeze({
   normal: { startSpeed: 2.65, maxSpeed: 3.7, speedRamp: 0.012, startGap: 2.85, minGap: 2.22, gapRamp: 0.004, spacing: 3.85 },
   hard: { startSpeed: 3.25, maxSpeed: 4.45, speedRamp: 0.018, startGap: 2.45, minGap: 1.9, gapRamp: 0.005, spacing: 3.55 },
@@ -65,11 +67,21 @@ function roomSnapshot(room) {
 }
 
 function stateSnapshot(room) {
+  const now = Date.now();
   return {
     type: 'state', phase: room.phase, speed: obstacleSpeed(room),
-    players: room.players.map(p => ({ id: p.id, y: p.y, vy: p.vy, alive: p.alive, score: p.score })),
+    players: room.players.map(p => ({ id: p.id, y: p.y, vy: p.vy, alive: p.alive, score: p.score,
+      heldPowerup: p.heldPowerup, requiredFlaps: p.requiredFlaps, flapProgress: p.flapProgress,
+      effectMs: Math.max(0, ...room.effects.filter(e => e.ownerId !== p.id && e.strength === p.requiredFlaps).map(e => e.until - now)) })),
     obstacles: room.obstacles.map(o => ({ id: o.id, x: o.x, gapY: o.gapY, gap: o.gap })),
+    powerUps: room.powerUps.map(o => ({ id: o.id, x: o.x, y: o.y, strength: o.strength })),
   };
+}
+
+function syncFlapRequirement(room, player, now = Date.now()) {
+  const required = Math.max(1, ...room.effects.filter(e => e.ownerId !== player.id && e.until > now).map(e => e.strength));
+  if (player.requiredFlaps !== required) { player.requiredFlaps = required; player.flapProgress = 0; }
+  return required;
 }
 
 function makeCode() {
@@ -109,16 +121,19 @@ function createRoom(peer, name) {
   if (rooms.size >= 500) return send(peer, { type: 'error', message: 'Server sedang penuh. Coba sebentar lagi.' });
   leave(peer);
   const code = makeCode();
-  const room = { code, hostId: peer.id, phase: 'lobby', difficulty: 'normal', players: [], obstacles: [], timer: null,
+  const room = { code, hostId: peer.id, phase: 'lobby', difficulty: 'normal', players: [], obstacles: [], powerUps: [], effects: [], timer: null,
     countdownTimer: null, prepareTimer: null, startsAt: null, previousPhase: null, roundId: 0, ready: new Set(),
-    elapsed: 0, nextId: 1, spawnIn: 1.55, broadcastIn: 0 };
+    elapsed: 0, nextId: 1, nextPowerId: 1, spawnIn: 1.55, broadcastIn: 0 };
   rooms.set(code, room);
   addPlayer(room, peer, name);
 }
 
 function addPlayer(room, peer, name) {
   peer.room = room;
-  room.players.push({ peer, id: peer.id, name: cleanName(name), color: (room.players.length % 7), y: 0, vy: 0, alive: true, score: 0, lastFlap: 0 });
+  const usedColors = new Set(room.players.map(p => p.color));
+  const color = Array.from({ length: MAX_PLAYERS }, (_, i) => i).find(i => !usedColors.has(i));
+  room.players.push({ peer, id: peer.id, name: cleanName(name), color, y: 0, vy: 0, alive: true, score: 0,
+    lastFlap: 0, lastPress: 0, lastProgressAt: 0, heldPowerup: 0, requiredFlaps: 1, flapProgress: 0 });
   send(peer, { type: 'joined', id: peer.id });
   broadcast(room, roomSnapshot(room));
 }
@@ -127,7 +142,7 @@ function joinRoom(peer, code, name) {
   const room = rooms.get((typeof code === 'string' ? code : '').trim().toUpperCase());
   if (!room) return send(peer, { type: 'error', message: 'Kode sesi tidak ditemukan.' });
   if (room.phase !== 'lobby') return send(peer, { type: 'error', message: 'Game sudah dimulai.' });
-  if (room.players.length >= MAX_PLAYERS) return send(peer, { type: 'error', message: 'Sesi sudah penuh (7 pemain).' });
+  if (room.players.length >= MAX_PLAYERS) return send(peer, { type: 'error', message: 'Sesi sudah penuh (8 pemain).' });
   leave(peer);
   addPlayer(room, peer, name);
 }
@@ -145,7 +160,7 @@ function start(room) {
     room.phase = room.previousPhase;
     broadcast(room, { type: 'error', message: 'Ada pemain yang belum siap. Coba mulai lagi.' });
     broadcast(room, roomSnapshot(room));
-  }, 12000);
+  }, PREPARE_TIMEOUT_MS);
 }
 
 function markReady(peer, roundId) {
@@ -172,10 +187,14 @@ function begin(room) {
   room.startsAt = null;
   room.elapsed = 0;
   room.obstacles = [];
+  room.powerUps = [];
+  room.effects = [];
   room.nextId = 1;
+  room.nextPowerId = 1;
   room.spawnIn = 1.35;
   room.broadcastIn = 0;
-  for (const p of room.players) Object.assign(p, { y: 0, vy: FLAP, alive: true, score: 0, lastFlap: 0 });
+  for (const p of room.players) Object.assign(p, { y: 0, vy: FLAP, alive: true, score: 0,
+    lastFlap: 0, lastPress: 0, lastProgressAt: 0, heldPowerup: 0, requiredFlaps: 1, flapProgress: 0 });
   broadcast(room, roomSnapshot(room));
   broadcast(room, stateSnapshot(room));
   room.timer = setInterval(() => tick(room, 1 / 60), 1000 / 60);
@@ -193,16 +212,28 @@ function finish(room) {
 function tick(room, dt) {
   if (room.phase !== 'playing') return;
   room.elapsed += dt;
+  const now = Date.now();
+  room.effects = room.effects.filter(e => e.until > now);
+  for (const p of room.players) syncFlapRequirement(room, p, now);
   const settings = DIFFICULTIES[room.difficulty];
   const speed = obstacleSpeed(room);
   room.spawnIn -= dt;
   if (room.spawnIn <= 0) {
     const gap = Math.max(settings.minGap, settings.startGap - room.elapsed * settings.gapRamp);
-    room.obstacles.push({ id: room.nextId++, x: 4.7, gapY: (Math.random() - 0.5) * 3.25, gap, passed: new Set() });
+    const obstacle = { id: room.nextId++, x: 4.7, gapY: (Math.random() - 0.5) * 3.25, gap, passed: new Set() };
+    room.obstacles.push(obstacle);
+    if (room.players.length > 1 && obstacle.id % 3 === 1) {
+      room.powerUps.push({ id: room.nextPowerId, x: 4.7 + settings.spacing / 2,
+        y: Math.max(FLOOR + 1, Math.min(CEILING - 1, obstacle.gapY)),
+        strength: room.nextPowerId % 2 ? 3 : 5 });
+      room.nextPowerId++;
+    }
     room.spawnIn += settings.spacing / speed;
   }
   for (const o of room.obstacles) o.x -= speed * dt;
   room.obstacles = room.obstacles.filter(o => o.x > -5.5);
+  for (const o of room.powerUps) o.x -= speed * dt;
+  room.powerUps = room.powerUps.filter(o => o.x > -5.5);
   for (const p of room.players) {
     if (!p.alive) continue;
     p.vy += GRAVITY * dt;
@@ -216,6 +247,14 @@ function tick(room, dt) {
         if (p.alive) p.score++;
       }
     }
+  }
+  for (const item of [...room.powerUps]) {
+    if (Math.abs(item.x - BIRD_X) > 0.48) continue;
+    const candidates = room.players.filter(p => p.alive && !p.heldPowerup && Math.abs(p.y - item.y) < 0.55)
+      .sort((a, b) => Math.abs(a.y - item.y) - Math.abs(b.y - item.y));
+    if (!candidates.length) continue;
+    candidates[0].heldPowerup = item.strength;
+    room.powerUps.splice(room.powerUps.indexOf(item), 1);
   }
   room.broadcastIn -= dt;
   if (room.broadcastIn <= 0) {
@@ -243,10 +282,24 @@ function handleMessage(peer, raw) {
   }
   else if (msg.type === 'start' && peer.room && peer.room.hostId === peer.id) start(peer.room);
   else if (msg.type === 'ready') markReady(peer, msg.roundId);
+  else if (msg.type === 'activate' && peer.room?.phase === 'playing') {
+    const room = peer.room, p = room.players.find(x => x.peer === peer);
+    if (!p?.alive || !p.heldPowerup) return;
+    room.effects.push({ ownerId: p.id, strength: p.heldPowerup, until: Date.now() + POWERUP_DURATION_MS });
+    p.heldPowerup = 0;
+    for (const player of room.players) syncFlapRequirement(room, player);
+    broadcast(room, stateSnapshot(room));
+  }
   else if (msg.type === 'flap' && peer.room?.phase === 'playing') {
-    const p = peer.room.players.find(x => x.peer === peer);
+    const room = peer.room, p = room.players.find(x => x.peer === peer);
     const now = Date.now();
-    if (p?.alive && now - p.lastFlap > 85) { p.vy = FLAP; p.lastFlap = now; }
+    if (!p?.alive || now - p.lastPress < 45 || now - p.lastFlap < 85) return;
+    p.lastPress = now;
+    const required = syncFlapRequirement(room, p, now);
+    if (now - p.lastProgressAt > 1500) p.flapProgress = 0;
+    p.lastProgressAt = now;
+    p.flapProgress++;
+    if (p.flapProgress >= required) { p.vy = FLAP; p.lastFlap = now; p.flapProgress = 0; }
   }
 }
 
@@ -302,4 +355,5 @@ setInterval(() => {
   }
 }, 25000).unref();
 
-server.listen(PORT, HOST, () => console.log(`Flappy Friends ready at http://${HOST}:${PORT}`));
+if (require.main === module) server.listen(PORT, HOST, () => console.log(`Flappy Friends ready at http://${HOST}:${PORT}`));
+module.exports = { begin, handleMessage, stateSnapshot, tick };
